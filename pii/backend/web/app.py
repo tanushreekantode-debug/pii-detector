@@ -1,0 +1,382 @@
+from pathlib import Path
+import os
+import uuid
+
+from flask import Flask, jsonify, request, send_from_directory
+from flask_cors import CORS
+from werkzeug.utils import secure_filename
+
+from scanner.engine import scan_file
+from scanner.report import write_json
+
+import logging
+
+logger = logging.getLogger("pii-detector")
+logger.setLevel(logging.INFO)
+
+# ============================================================
+# PATHS
+# ============================================================
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+UPLOAD_DIR = BASE_DIR / "uploads"
+REPORT_PATH = BASE_DIR / "privacy_findings.json"
+
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ============================================================
+# FLASK APP
+# ============================================================
+
+app = Flask(
+    __name__,
+    static_folder="static",
+    static_url_path=""
+)
+CORS(app)
+
+# Maximum upload size: 10 MB
+MAX_FILE_SIZE = 10 * 1024 * 1024
+
+app.config["MAX_CONTENT_LENGTH"] = MAX_FILE_SIZE
+
+
+# ============================================================
+# ALLOWED FILE TYPES
+# ============================================================
+
+ALLOWED_EXTENSIONS = {
+    # Images
+    "png",
+    "jpg",
+    "jpeg",
+    "bmp",
+    "tif",
+    "tiff",
+    "webp",
+
+    # PDF
+    "pdf",
+
+    # Excel / spreadsheets
+    "csv",
+    "xlsx",
+    "xlsm",
+
+    # Microsoft Office
+    "docx",
+    "pptx",
+
+    # Text
+    "txt",
+    "md",
+    "log",
+
+    # Data / markup
+    "json",
+    "xml",
+    "html",
+    "htm",
+    "yaml",
+    "yml",
+}
+
+
+# ============================================================
+# CORS
+# ============================================================
+#
+# Cross-origin access is allowed for known local/external frontends.
+# The normal AWS deployment is same-origin and does not require CORS.
+# ============================================================
+
+ALLOWED_ORIGINS = {
+    "https://pii-detector-xi.vercel.app",
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:5173",
+}
+ALLOWED_ORIGINS.update(
+    origin.strip().rstrip("/")
+    for origin in os.environ.get("ALLOWED_ORIGINS", "").split(",")
+    if origin.strip()
+)
+
+
+@app.after_request
+def add_cors_headers(response):
+    origin = request.headers.get("Origin")
+
+    if origin in ALLOWED_ORIGINS:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Headers"] = (
+            "Content-Type, Authorization"
+        )
+        response.headers["Access-Control-Allow-Methods"] = (
+            "GET, POST, OPTIONS"
+        )
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+
+    return response
+
+
+# ============================================================
+# HELPER FUNCTIONS
+# ============================================================
+
+def allowed_file(filename: str) -> bool:
+    """
+    Check whether the uploaded file has a supported extension.
+    """
+
+    if not filename:
+        return False
+
+    if "." not in filename:
+        return False
+
+    extension = filename.rsplit(".", 1)[1].lower()
+
+    return extension in ALLOWED_EXTENSIONS
+
+
+# ============================================================
+# HOME / HEALTH CHECK
+# ============================================================
+
+@app.get("/")
+def index():
+    """Serve the built React application when present, otherwise return health JSON."""
+    frontend_index = Path(app.static_folder or "static") / "index.html"
+    if frontend_index.exists():
+        return send_from_directory(app.static_folder, "index.html")
+
+    return jsonify({
+        "status": "online",
+        "service": "PII Detector Backend",
+        "message": "PII detection API is running.",
+        "endpoint": "/api/scan",
+        "method": "POST",
+        "max_file_size_mb": 10,
+        "supported_formats": sorted(ALLOWED_EXTENSIONS)
+    })
+
+
+@app.get("/health")
+def health():
+    return jsonify({"status": "ok", "service": "PII Detector"})
+
+
+# ============================================================
+# SCAN API
+# ============================================================
+
+@app.route("/api/scan", methods=["POST", "OPTIONS"])
+def scan_upload():
+
+    # --------------------------------------------------------
+    # Handle browser CORS preflight request
+    # --------------------------------------------------------
+
+    if request.method == "OPTIONS":
+        return "", 204
+
+    # --------------------------------------------------------
+    # Get uploaded file
+    # --------------------------------------------------------
+
+    uploaded_file = request.files.get("file")
+
+    if uploaded_file is None:
+        return jsonify({
+            "success": False,
+            "error": "No file was uploaded.",
+            "message": "Please select a file using the 'file' field."
+        }), 400
+
+    # --------------------------------------------------------
+    # Check filename
+    # --------------------------------------------------------
+
+    original_filename = uploaded_file.filename
+    scan_id = uuid.uuid4().hex
+
+    if not original_filename:
+        return jsonify({
+            "success": False,
+            "error": "Please select a file."
+        }), 400
+
+    # --------------------------------------------------------
+    # Check extension
+    # --------------------------------------------------------
+
+    if not allowed_file(original_filename):
+        extension = (
+            original_filename.rsplit(".", 1)[1].lower()
+            if "." in original_filename
+            else ""
+        )
+
+        return jsonify({
+            "success": False,
+            "error": "Unsupported file type.",
+            "extension": extension,
+            "supported_formats": sorted(ALLOWED_EXTENSIONS)
+        }), 400
+
+    # --------------------------------------------------------
+    # Secure filename
+    # --------------------------------------------------------
+
+    safe_filename = secure_filename(original_filename)
+
+    if not safe_filename:
+        return jsonify({
+            "success": False,
+            "error": "Invalid filename."
+        }), 400
+
+    # --------------------------------------------------------
+    # Generate unique filename
+    #
+    # Prevents two users uploading files with the same name
+    # from overwriting each other.
+    # --------------------------------------------------------
+
+    unique_id = uuid.uuid4().hex
+
+    extension = safe_filename.rsplit(".", 1)[1].lower()
+
+    stored_filename = f"{unique_id}.{extension}"
+
+    file_path = UPLOAD_DIR / stored_filename
+
+    # --------------------------------------------------------
+    # Save uploaded file
+    # --------------------------------------------------------
+
+    try:
+        uploaded_file.save(file_path)
+
+        logger.info("Scan %s started for %s", scan_id, original_filename)
+
+    except Exception as exc:
+        return jsonify({
+            "success": False,
+            "error": "Could not save uploaded file.",
+            "detail": str(exc)
+        }), 500
+
+    # --------------------------------------------------------
+    # Scan file
+    # --------------------------------------------------------
+
+    try:
+
+        findings = scan_file(file_path)
+
+        # Save the report when the runtime filesystem is writable.
+        # A report-write failure should not make an otherwise successful scan fail.
+        try:
+            write_json(findings, REPORT_PATH)
+        except OSError:
+            pass
+
+        # Convert findings to dictionaries
+        finding_data = []
+
+        for finding in findings:
+            try:
+                finding_data.append(finding.as_dict())
+            except AttributeError:
+                finding_data.append({
+                    "finding": str(finding)
+                })
+
+        logger.info("Scan %s completed: %d findings", scan_id, len(findings))
+
+        # ----------------------------------------------------
+        # Return the scan result. Values are intentionally masked.
+        # ----------------------------------------------------
+
+        return jsonify({
+            "success": True,
+            "filename": original_filename,
+            "stored_filename": stored_filename,
+            "finding_count": len(findings),
+            "findings": finding_data
+        }), 200
+
+    except Exception as exc:
+        # Keep the API response JSON so the frontend can show the real backend
+        # failure instead of only receiving an opaque HTTP 500.
+        detail = str(exc) or exc.__class__.__name__
+        error_type = exc.__class__.__name__
+        logger.exception("Scan %s failed", scan_id)
+
+        return jsonify({
+            "success": False,
+            "error": "The file could not be scanned.",
+            "detail": detail,
+            "error_type": error_type
+        }), 500
+
+    finally:
+
+        # ----------------------------------------------------
+        # Delete the uploaded temporary file after scanning.
+        # This prevents server storage from filling up.
+        # ----------------------------------------------------
+
+        try:
+            if file_path.exists():
+                file_path.unlink()
+        except Exception:
+            pass
+
+
+
+# ============================================================
+# FILE TOO LARGE
+# ============================================================
+
+@app.errorhandler(413)
+def too_large(_error):
+
+    return jsonify({
+        "success": False,
+        "error": "File is too large.",
+        "message": "Maximum file size is 10 MB."
+    }), 413
+
+
+# ============================================================
+# GENERAL ERROR HANDLER
+# ============================================================
+
+@app.errorhandler(500)
+def internal_error(_error):
+
+    return jsonify({
+        "success": False,
+        "error": "Internal server error."
+    }), 500
+
+
+# ============================================================
+# RUN LOCALLY
+# ============================================================
+
+if __name__ == "__main__":
+
+    port = int(os.environ.get("PORT", 5000))
+
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        debug=False
+    )
